@@ -1,4 +1,4 @@
-package scaloid.example
+package org.byteflame.flamethrower
 
 import org.scaloid.common._
 import android.graphics.Color
