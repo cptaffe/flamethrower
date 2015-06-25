@@ -1,25 +1,20 @@
 package org.byteflame.flamethrower
 
-import org.scaloid.common._
-import android.graphics.Color
+import android.{content, os, app}
 
-class HelloScaloid extends SActivity {
+// Background Service
+// Checks if default device is set, if not sends notification
+// Checks if bluetooth is on, else waits until turned on
+// Waits until the default device is seen then attempts to connect
+// Lazily polls for current gasoline level
+// On gasoline level < some percentage, sends notification
+// On notification click, opens google maps with intent for local
+// gas stations
+object FlameService extends app.Service {
+	val lowGasoline : Double = 10
+	val binder = new os.Binder
 
-	onCreate {
-		contentView = new SVerticalLayout {
-			style {
-				case b: SButton => b.textColor(Color.RED).onClick(toast("Bang!"))
-				case t: STextView => t textSize 10.dip
-				case e: SEditText => e.backgroundColor(Color.YELLOW).textColor(Color.BLACK)
-			}
-			STextView("I am 10 dip tall")
-			STextView("Me too")
-			STextView("I am 15 dip tall") textSize 15.dip // overriding
-			this += new SLinearLayout {
-				STextView("Button: ")
-				SButton(R.string.red)
-			}.wrap
-			SEditText("Yellow input field fills the space").fill
-		} padding 20.dip
+	override def onBind(intent: content.Intent) : os.IBinder = {
+		binder
 	}
 }

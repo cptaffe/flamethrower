@@ -20,7 +20,7 @@ android {
     // Can be built with API Level 16 or higher, while this app retains runtime compatibility from API Level 10. Please refer to targetSdkVersion property
     compileSdkVersion "android-16"
     buildToolsVersion "22.0.1"
-	
+
     defaultConfig {
         minSdkVersion 10
         targetSdkVersion 16
@@ -43,5 +43,4 @@ android {
 
 dependencies {
     compile "org.scala-lang:scala-library:2.11.6"
-	compile "org.scaloid:scaloid_2.11:4.0-RC1+"
 }
