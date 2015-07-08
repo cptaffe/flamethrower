@@ -1,6 +1,7 @@
 package org.byteflame.flamethrower
 
 import android.{content, os, app, widget, graphics, view, util, bluetooth}
+import android.support.v7
 import scala.concurrent._
 
 // FlameThrower App
@@ -54,6 +55,11 @@ object SavedData {
 		e.putString(MAC_ADDRESS, addr)
 		e.commit
 	})(context.getSharedPreferences(SETTINGS_FILE_KEY, content.Context.MODE_PRIVATE).edit)
+
+	def clearMacAddress(context : content.Context) = ((e : content.SharedPreferences.Editor) => {
+		e.clear
+		e.commit
+	})(context.getSharedPreferences(SETTINGS_FILE_KEY, content.Context.MODE_PRIVATE).edit)
 }
 
 // Background Service
@@ -65,7 +71,8 @@ object SavedData {
 // On notification click, opens google maps with intent for local
 // gas stations
 object Background {
-	val notifIds = new Enumeration {
+	object notifIds extends Enumeration {
+		type notifIds = Value
 		val EnableBt, UnsupportedDev, SelectBt = Value
 	}
 }
@@ -73,21 +80,18 @@ object Background {
 class Background extends app.Service {
 
 	// Notifications that could be sent
-	private def unsupportedDevNotice(lc : content.Context) : Notification = new Notification(lc,
+	private def unsupportedDevNotice = new Notification(this,
 		Background.notifIds.UnsupportedDev.id,
 		"Unsupported Device",
-		"FlameThrower requires bluetooth to search for devices."
-	)
+		"FlameThrower requires bluetooth to search for devices.")
 
-	private def unselectedDevNotice(lc : content.Context) : Notification = new Notification(lc,
+	private def unselectedDevNotice = new Notification(this,
 		Background.notifIds.SelectBt.id,
 		"Choose Device",
 		"Tell FlameThrower which device to connect to.",
 		app.PendingIntent.getActivity(this, 0,
 			new content.Intent(this, classOf[ChooseDevice]),
-			app.PendingIntent.FLAG_UPDATE_CURRENT)
-	)
-
+			app.PendingIntent.FLAG_UPDATE_CURRENT))
 
 	// Use Channels to communicate blocking tasks.
 	private val addrChan = new Channel[Option[String]]
@@ -110,8 +114,12 @@ class Background extends app.Service {
 	override def onStartCommand(intent : content.Intent, flags : Int,
 			startId : Int) : Int = {
 
+		// TESTING REMOVE LATER
+		SavedData.clearMacAddress(this)
+
 		// Local Context for notification building from runnable
 		this match {
+			// Run handler in new thread
 			case lc : content.Context => new Thread(new Runnable {
 				// Block until bluetooth adapter is enabled
 				override def run = {
@@ -132,14 +140,13 @@ class Background extends app.Service {
 	override def onBind(intent: content.Intent) : os.IBinder = {
 		// Calling startService will ensure that the service
 		// is running before a bind occurs
-		util.Log.d("FlameThrower", "Starting service from Bind")
 		startService(new content.Intent(this, classOf[Background]))
 		binder
 	}
 
 	private def setup(lc : content.Context) = getBluetoothAdapter(bluetooth.BluetoothAdapter.getDefaultAdapter()) match {
 			// Notify user of unsupported device
-			case None => unsupportedDevNotice(lc).display
+			case None => unsupportedDevNotice.display
 			// Bluetooth Adapter avaliable and enabled
 			case ba if ba.isDefined => {
 				(SavedData.getMacAddress(lc) match {
@@ -147,7 +154,7 @@ class Background extends app.Service {
 					case None => {
 						// Notify user that no default address is set
 						// Link to activity that allows user to choose
-						unselectedDevNotice(lc).display
+						unselectedDevNotice.display
 
 						// Wait for address to be sent
 						addrChan.read match {
@@ -241,9 +248,6 @@ class BindActivity extends app.Activity {
 // Enable Bluetooth Activity
 // Opened via notification action, enables bluetooth
 class EnableBluetooth extends BindActivity {
-	// Thread signals when it has finished
-	val doneChan = new Channel[Boolean]
-
 	override def onCreate(instance : os.Bundle) = {
 		super.onCreate(instance)
 
@@ -253,8 +257,15 @@ class EnableBluetooth extends BindActivity {
 		val textview = new widget.TextView(this)
 		setContentView((() => {
 			var layout = new widget.LinearLayout(this)
+			layout.setLayoutParams(new widget.LinearLayout.LayoutParams(view.ViewGroup.LayoutParams.MATCH_PARENT, view.ViewGroup.LayoutParams.MATCH_PARENT, 1))
 			layout.addView((() => {
 				textview.setText("Turning on Bluetooth...")
+				textview.setGravity(view.Gravity.CENTER)
+				textview.setLayoutParams((() => {
+					var lp = new widget.LinearLayout.LayoutParams(view.ViewGroup.LayoutParams.WRAP_CONTENT, view.ViewGroup.LayoutParams.WRAP_CONTENT, 1)
+					lp.gravity = view.Gravity.CENTER
+					lp
+				})())
 				textview
 			})())
 			layout
@@ -266,10 +277,7 @@ class EnableBluetooth extends BindActivity {
 			case lc : content.Context => new Thread(new Runnable {
 				def run = {
 					// Read service and send bluetooth alert
-					util.Log.d(TAG, "Attempting to getService")
 					serviceChan.read.alertBluetoothEnabled
-					util.Log.d(TAG, "Have gotten service")
-					doneChan.write(true)
 
 					doTasks.post(new Runnable {
 						// Alert user of bluetoth enabledness
@@ -285,32 +293,51 @@ class EnableBluetooth extends BindActivity {
 	}
 }
 
+object TestAdapter {
+	class ViewHolder(v : widget.TextView) extends v7.widget.RecyclerView.ViewHolder(v) {
+		var textview = v
+	}
+}
+
+class TestAdapter(chan : Channel[String], devices : Array[bluetooth.BluetoothDevice]) extends v7.widget.RecyclerView.Adapter[TestAdapter.ViewHolder] {
+
+	override def onCreateViewHolder(parent : view.ViewGroup, viewType : Int) : TestAdapter.ViewHolder = new TestAdapter.ViewHolder(new widget.TextView(parent.getContext()))
+
+	override def onBindViewHolder(holder : TestAdapter.ViewHolder, position : Int) = {
+		val dev = devices(position)
+		holder.textview.setText(dev.getName + "\n" + dev.getAddress)
+		holder.textview.setOnClickListener(new view.View.OnClickListener {
+			def onClick(v : view.View) {
+				chan.write(dev.getAddress)
+			}
+		})
+	}
+
+	override def getItemCount : Int = devices.length
+}
+
 // Choose Device Activity
 // Opened via notification action, allows user to pick device
 class ChooseDevice extends BindActivity {
+	private val ADAPTER_VIEW_ID = 0xbada55
+
 	override def onCreate(instance : os.Bundle) = {
 		super.onCreate(instance)
 
+		val chan = new Channel[String]
+
 		setContentView((() => {
-			var layout = new widget.LinearLayout(this)
-			layout.addView((() => {
-				var b = new widget.Button(this)
-				b.setText("Test")
-				b.setBackgroundColor(graphics.Color.RED)
-				b.setOnClickListener(
-					new view.View.OnClickListener {
-						def onClick(v : view.View) {
-							// Wait for service to bind before using service
-							new Thread(new Runnable {
-								def run = {
-									// TODO: send bluetooth device mac address
-								}
-							}).start
-							}})
-				b
-			})())
-			layout
+			var rview = new v7.widget.RecyclerView(this)
+			rview.setLayoutManager(new v7.widget.LinearLayoutManager(this))
+			rview.setAdapter(new TestAdapter(chan, bluetooth.BluetoothAdapter.getDefaultAdapter.getBondedDevices.toArray(new Array[bluetooth.BluetoothDevice](0))))
+			rview
 		})())
+
+		new Thread(new Runnable {
+			// Blocks until both service is ready and an address is
+			// selected
+			def run = serviceChan.read.alertAddressSelected(Some(chan.read))
+		}).start
 
 		// Cancel notification
 		Notification.cancel(this, Background.notifIds.SelectBt.id)
@@ -351,10 +378,16 @@ class Main extends BindActivity {
 
 		setContentView((() => {
 			var layout = new widget.LinearLayout(this)
+			layout.setGravity(view.Gravity.CENTER)
 			layout.addView((() => {
 				var b = new widget.Button(this)
 				b.setText("Test")
 				b.setBackgroundColor(graphics.Color.RED)
+				b.setLayoutParams((() => {
+					var lp = new widget.LinearLayout.LayoutParams(100, view.ViewGroup.LayoutParams.WRAP_CONTENT)
+					lp.gravity = view.Gravity.CENTER
+					lp
+				})())
 				b.setOnClickListener(
 					new view.View.OnClickListener {
 						def onClick(v : view.View) {
