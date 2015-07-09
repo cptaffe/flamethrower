@@ -35,6 +35,8 @@ class Notification(context : content.Context, id : Int, title : String, text : S
 			})())
 		case _ => throw new ClassCastException
 	}
+
+	def cancel = Notification.cancel(context, id)
 }
 
 // Abstracts the getting and setting of saved data
@@ -93,6 +95,14 @@ class Background extends app.Service {
 			new content.Intent(this, classOf[ChooseDevice]),
 			app.PendingIntent.FLAG_UPDATE_CURRENT))
 
+	private def disabledBluetoothNotice = new Notification(this,
+		Background.notifIds.EnableBt.id,
+		"Enable Bluetooth?",
+		"FlameThrower requires bluetooth to search for devices.",
+		app.PendingIntent.getActivity(this, 0,
+			new content.Intent(this, classOf[EnableBluetooth]),
+			app.PendingIntent.FLAG_UPDATE_CURRENT))
+
 	// Use Channels to communicate blocking tasks.
 	private val addrChan = new Channel[Option[String]]
 	private val btEnableChan = new Channel[Boolean]
@@ -148,34 +158,43 @@ class Background extends app.Service {
 			// Notify user of unsupported device
 			case None => unsupportedDevNotice.display
 			// Bluetooth Adapter avaliable and enabled
-			case ba if ba.isDefined => {
+			case Some(ba) => {
 				(SavedData.getMacAddress(lc) match {
 					// No default address set
 					case None => {
 						// Notify user that no default address is set
 						// Link to activity that allows user to choose
-						unselectedDevNotice.display
+						val notif = unselectedDevNotice
+						notif.display
 
 						// Wait for address to be sent
-						addrChan.read match {
-							case addr if addr.isDefined => {
-								// Save new addr
-								SavedData.setMacAddress(lc, addr.get)
-								addr
-							}
-							case _ => None
+						def lambda = addrChan.read match {
+							case Some(addr) => SavedData.setMacAddress(lc, addr)
+							case None => ()
 						}
+						// block for it to be set at least once
+						lambda
+						notif.cancel
+
+						// forever keep it updated
+						new Thread(new Runnable {
+							def run = while (true) lambda
+						}).start
 					}
-					case addr => addr
-				}) match {
-					case addr if addr.isDefined => {
-						// Test toast to show workingness
-						widget.Toast.makeText(
+					case Some(_) => ()
+				})
+
+				SavedData.getMacAddress(lc) match {
+					case Some(addr) => widget.Toast.makeText(
 							lc,
-							addr.get,
+							addr,
 							widget.Toast.LENGTH_SHORT
 						).show
-					}
+					case None => widget.Toast.makeText(
+							lc,
+							"NONE!",
+							widget.Toast.LENGTH_SHORT
+						).show
 				}
 			}
 		}
@@ -195,18 +214,14 @@ class Background extends app.Service {
 				// Bluetooth is not enabled
 				// Send notification to user allowing for user to enable
 				// bluetooth via click.
-				new Notification(this,
-					Background.notifIds.EnableBt.id,
-					"Enable Bluetooth?",
-					"FlameThrower requires bluetooth to search for devices.",
-					app.PendingIntent.getActivity(this, 0,
-						new content.Intent(this, classOf[EnableBluetooth]),
-						app.PendingIntent.FLAG_UPDATE_CURRENT)
-				).display
+				var notif = disabledBluetoothNotice
+				notif.display
 
 				// Wait here until bluetooth is enabled
 				// False could be returned which should cause failure
-				if (btEnableChan.read) Some(ba) else None
+				var b = btEnableChan.read
+				notif.cancel
+				if (b) Some(ba) else None
 			}
 		}
 	}
@@ -287,30 +302,57 @@ class EnableBluetooth extends BindActivity {
 			}).start
 			case _ => throw new ClassCastException
 		}
-
-		// Cancel notification
-		Notification.cancel(this, Background.notifIds.EnableBt.id)
 	}
 }
 
 object TestAdapter {
-	class ViewHolder(v : widget.TextView) extends v7.widget.RecyclerView.ViewHolder(v) {
-		var textview = v
+	class ViewHolder(v : android.view.View) extends v7.widget.RecyclerView.ViewHolder(v) {
+		var view = v
 	}
 }
 
 class TestAdapter(chan : Channel[String], devices : Array[bluetooth.BluetoothDevice]) extends v7.widget.RecyclerView.Adapter[TestAdapter.ViewHolder] {
 
+	object SelectedView {
+		var selectedView : view.View = null
+
+		private def doAnimations(v : view.View) = v.animate.alpha(1.0f)
+		private def undoAnimations(v : view.View) = v.animate.alpha(0.5f)
+
+		def set(v : view.View) = {
+			if (selectedView != null) undoAnimations(selectedView)
+			selectedView = v
+			doAnimations(selectedView)
+		}
+	}
+
 	override def onCreateViewHolder(parent : view.ViewGroup, viewType : Int) : TestAdapter.ViewHolder = new TestAdapter.ViewHolder(new widget.TextView(parent.getContext()))
 
 	override def onBindViewHolder(holder : TestAdapter.ViewHolder, position : Int) = {
-		val dev = devices(position)
-		holder.textview.setText(dev.getName + "\n" + dev.getAddress)
-		holder.textview.setOnClickListener(new view.View.OnClickListener {
-			def onClick(v : view.View) {
-				chan.write(dev.getAddress)
+		((t : widget.TextView, dev : bluetooth.BluetoothDevice) => {
+			t.setPadding(20, 10, 20, 10)
+			t.setBackgroundColor(graphics.Color.parseColor("#e8e8e8"))
+			t.setLayoutParams((() => {
+				var lp = new view.ViewGroup.MarginLayoutParams(view.ViewGroup.LayoutParams.MATCH_PARENT, view.ViewGroup.LayoutParams.WRAP_CONTENT)
+				lp.setMargins(5, 5, 5, 5)
+				lp
+			})())
+			t.setText(dev.getName + "\n" + dev.getAddress)
+			t.setAlpha(0.5f)
+			SavedData.getMacAddress(t.getContext) match {
+				case Some(addr) => if (addr == dev.getAddress) SelectedView.set(t)
+				case None => ()
 			}
-		})
+			t.setOnClickListener(new view.View.OnClickListener {
+				def onClick(v : view.View) {
+					SelectedView.set(v)
+					chan.write(dev.getAddress)
+				}
+			})
+		})(holder.view match {
+			case v : widget.TextView => v
+			case _ => throw new ClassCastException
+		}, devices(position))
 	}
 
 	override def getItemCount : Int = devices.length
@@ -338,9 +380,6 @@ class ChooseDevice extends BindActivity {
 			// selected
 			def run = serviceChan.read.alertAddressSelected(Some(chan.read))
 		}).start
-
-		// Cancel notification
-		Notification.cancel(this, Background.notifIds.SelectBt.id)
 	}
 }
 
