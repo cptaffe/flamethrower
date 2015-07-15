@@ -402,6 +402,10 @@ class TestAdapter(chan : Channel[String], devices : Array[bluetooth.BluetoothDev
 	override def getItemCount : Int = devices.length
 }
 
+object ChooseDevice {
+	val chan = new Channel[String]
+}
+
 // Choose Device Activity
 // Opened via notification action, allows user to pick device
 class ChooseDevice extends BindActivity {
@@ -410,22 +414,20 @@ class ChooseDevice extends BindActivity {
 	override def onCreate(instance : os.Bundle) = {
 		super.onCreate(instance)
 
-		val chan = new Channel[String]
-
 		setContentView((() => {
 			var rview = new v7.widget.RecyclerView(this)
 			rview.setLayoutManager(new v7.widget.LinearLayoutManager(this))
-			rview.setAdapter(new TestAdapter(chan, bluetooth.BluetoothAdapter.getDefaultAdapter.getBondedDevices.toArray(new Array[bluetooth.BluetoothDevice](0))))
+			rview.setAdapter(new TestAdapter(ChooseDevice.chan, bluetooth.BluetoothAdapter.getDefaultAdapter.getBondedDevices.toArray(new Array[bluetooth.BluetoothDevice](0))))
 			rview
 		})())
 
 		new Thread(new Runnable {
 			// Blocks until both service is ready and an address is
-			// selected
+			// selected, loops to relay further clicks.
 			def run = {
 				var s = serviceChan.read
 				while (true) {
-					var c = chan.read
+					var c = ChooseDevice.chan.read
 					s.StartUp.alertAddressSelected(c match {
 						case null => None
 						case c => Some(c)
