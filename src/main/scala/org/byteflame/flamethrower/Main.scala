@@ -81,37 +81,147 @@ object Background {
 
 class Background extends app.Service {
 
-	// Notifications that could be sent
-	private def unsupportedDevNotice = new Notification(this,
-		Background.notifIds.UnsupportedDev.id,
-		"Unsupported Device",
-		"FlameThrower requires bluetooth to search for devices.")
-
-	private def unselectedDevNotice = new Notification(this,
-		Background.notifIds.SelectBt.id,
-		"Choose Device",
-		"Tell FlameThrower which device to connect to.",
-		app.PendingIntent.getActivity(this, 0,
-			new content.Intent(this, classOf[ChooseDevice]),
-			app.PendingIntent.FLAG_UPDATE_CURRENT))
-
-	private def disabledBluetoothNotice = new Notification(this,
-		Background.notifIds.EnableBt.id,
-		"Enable Bluetooth?",
-		"FlameThrower requires bluetooth to search for devices.",
-		app.PendingIntent.getActivity(this, 0,
-			new content.Intent(this, classOf[EnableBluetooth]),
-			app.PendingIntent.FLAG_UPDATE_CURRENT))
-
-	// Use Channels to communicate blocking tasks.
-	private val addrChan = new Channel[Option[String]]
-	private val btEnableChan = new Channel[Boolean]
-
-	// Callbacks notify blocking tasks
-	def alertBluetoothEnabled = btEnableChan.write(true)
-	def alertAddressSelected(addr : Option[String]) = addrChan.write(addr)
-
 	var workHandler : os.Handler = null
+
+	// StartUp contains code for starting up
+	// the service and waiting for user changes from
+	// the appropriate activities.
+	object StartUp {
+		// Use Channels to communicate blocking tasks.
+		private val addrChan = new Channel[Option[String]]
+		private val btEnableChan = new Channel[Boolean]
+
+		// Callbacks notify blocking tasks
+		def alertBluetoothEnabled = btEnableChan.write(true)
+		def alertAddressSelected(addr : Option[String]) = addrChan.write(addr)
+	}
+
+	class WaitAndConnect extends Runnable {
+		val uuid = java.util.UUID.fromString("00001101-0000-1000-8000-00805F9B34FB")
+
+		def run {
+			SavedData.getMacAddress(Background.this) match {
+				case Some(addr) => try {
+						val conn = bluetooth.BluetoothAdapter.getDefaultAdapter.getRemoteDevice(addr).createInsecureRfcommSocketToServiceRecord(uuid)
+						conn.connect()
+						workHandler.post(new Runnable {
+							def run {
+								var in = conn.getInputStream
+								var out = conn.getOutputStream
+
+								def sendrcv(cmd : String) : String = {
+									var reply = ""
+									out.write((cmd+"\r").getBytes)
+									out.flush
+									Stream.continually(in.read).takeWhile(_ != '>').foreach(reply += _)
+									reply
+								}
+
+								sendrcv("atz")   // reset
+								sendrcv("ate0")  // echo off
+								sendrcv("atl0")  // line feeds off
+								sendrcv("ats0")  // spaces off
+								sendrcv("ath0")  // headers off
+								sendrcv("atsp0") // protocol auto
+
+								var fuelLevel = (() => {
+									var str = sendrcv("012F").trim.replace('\r', '\n')
+									str = str.substring(str.length - 2)
+									Integer.parseInt(str) // byte
+								})()
+
+								widget.Toast.makeText(
+									getApplicationContext(),
+									"FUEL LEVEL: " + fuelLevel,
+									widget.Toast.LENGTH_SHORT
+								).show
+
+								// check every 30 seconds
+								workHandler.postDelayed(this, java.util.concurrent.TimeUnit.MILLISECONDS.convert(30, java.util.concurrent.TimeUnit.SECONDS))
+							}
+						})
+					} catch {
+						// restart this in five seconds
+						case ioe: java.io.IOException => workHandler.postDelayed(new WaitAndConnect, java.util.concurrent.TimeUnit.MILLISECONDS.convert(5, java.util.concurrent.TimeUnit.SECONDS))
+					}
+				case None => ()
+			}
+		}
+	}
+
+	class StartUp extends Runnable {
+		// Notifications that could be sent
+		private def unsupportedDevNotice = new Notification(Background.this,
+			Background.notifIds.UnsupportedDev.id,
+			"Unsupported Device",
+			"FlameThrower requires bluetooth to search for devices.")
+
+		private def unselectedDevNotice = new Notification(Background.this,
+			Background.notifIds.SelectBt.id,
+			"Choose Device",
+			"Tell FlameThrower which device to connect to.",
+			app.PendingIntent.getActivity(Background.this, 0,
+				new content.Intent(Background.this, classOf[ChooseDevice]),
+				app.PendingIntent.FLAG_UPDATE_CURRENT))
+
+		private def disabledBluetoothNotice = new Notification(Background.this,
+			Background.notifIds.EnableBt.id,
+			"Enable Bluetooth?",
+			"FlameThrower requires bluetooth to search for devices.",
+			app.PendingIntent.getActivity(Background.this, 0,
+				new content.Intent(Background.this, classOf[EnableBluetooth]),
+				app.PendingIntent.FLAG_UPDATE_CURRENT))
+
+		def run = ((ba : bluetooth.BluetoothAdapter) => ba match {
+			// Device does not support bluetooth
+			// Send notification to user detailing failure.
+			case null => None
+			case ba if ba.isEnabled => Some(ba)
+			case ba if !ba.isEnabled => {
+				// Bluetooth is not enabled
+				// Send notification to user allowing for user to enable
+				// bluetooth via click.
+				var notif = disabledBluetoothNotice
+				notif.display
+
+				// Wait here until bluetooth is enabled
+				// False could be returned which should cause failure
+				var b = StartUp.btEnableChan.read
+				notif.cancel
+				if (b) Some(ba) else None
+			}
+		})(bluetooth.BluetoothAdapter.getDefaultAdapter()) match {
+			// Notify user of unsupported device
+			case None => unsupportedDevNotice.display
+			// Bluetooth Adapter avaliable and enabled
+			case Some(ba) => {
+				(SavedData.getMacAddress(Background.this) match {
+					// No default address set
+					case None => {
+						// Notify user that no default address is set
+						// Link to activity that allows user to choose
+						val notif = unselectedDevNotice
+						notif.display
+
+						// Wait for address to be sent
+						def lambda = StartUp.addrChan.read match {
+							case Some(addr) => SavedData.setMacAddress(Background.this, addr)
+							case None => ()
+						}
+						// block for it to be set at least once
+						lambda
+						notif.cancel
+
+						// forever keep it updated
+						new Thread(new Runnable {
+							def run = while (true) lambda
+						}).start
+					}
+					case Some(_) => ()
+				})
+			}
+		}
+	}
 
 	// Binder class
 	// Provides access to the Background service via
@@ -135,9 +245,8 @@ class Background extends app.Service {
 				override def run = {
 					os.Looper.prepare
 					workHandler = new os.Handler
-					workHandler.post(new Runnable {
-						def run = setup(lc)
-					})
+					workHandler.post(new StartUp)
+					workHandler.post(new WaitAndConnect)
 					os.Looper.loop
 				}
 			}).start
@@ -152,78 +261,6 @@ class Background extends app.Service {
 		// is running before a bind occurs
 		startService(new content.Intent(this, classOf[Background]))
 		binder
-	}
-
-	private def setup(lc : content.Context) = getBluetoothAdapter(bluetooth.BluetoothAdapter.getDefaultAdapter()) match {
-			// Notify user of unsupported device
-			case None => unsupportedDevNotice.display
-			// Bluetooth Adapter avaliable and enabled
-			case Some(ba) => {
-				(SavedData.getMacAddress(lc) match {
-					// No default address set
-					case None => {
-						// Notify user that no default address is set
-						// Link to activity that allows user to choose
-						val notif = unselectedDevNotice
-						notif.display
-
-						// Wait for address to be sent
-						def lambda = addrChan.read match {
-							case Some(addr) => SavedData.setMacAddress(lc, addr)
-							case None => ()
-						}
-						// block for it to be set at least once
-						lambda
-						notif.cancel
-
-						// forever keep it updated
-						new Thread(new Runnable {
-							def run = while (true) lambda
-						}).start
-					}
-					case Some(_) => ()
-				})
-
-				SavedData.getMacAddress(lc) match {
-					case Some(addr) => widget.Toast.makeText(
-							lc,
-							addr,
-							widget.Toast.LENGTH_SHORT
-						).show
-					case None => widget.Toast.makeText(
-							lc,
-							"NONE!",
-							widget.Toast.LENGTH_SHORT
-						).show
-				}
-			}
-		}
-
-	// Blocking function, sets up bluetooth
-	private def getBluetoothAdapter(ba : bluetooth.BluetoothAdapter) : Option[bluetooth.BluetoothAdapter] = {
-		// This closure checks if bluetooth is enabled or can be
-		// If bluetooth cannot be enabled, it returns false
-		// Otherwise it waits until enabled and returns true
-		// on success
-	 	ba match {
-			// Device does not support bluetooth
-			// Send notification to user detailing failure.
-			case null => None
-			case ba if ba.isEnabled => Some(ba)
-			case ba if !ba.isEnabled => {
-				// Bluetooth is not enabled
-				// Send notification to user allowing for user to enable
-				// bluetooth via click.
-				var notif = disabledBluetoothNotice
-				notif.display
-
-				// Wait here until bluetooth is enabled
-				// False could be returned which should cause failure
-				var b = btEnableChan.read
-				notif.cancel
-				if (b) Some(ba) else None
-			}
-		}
 	}
 }
 
@@ -292,7 +329,7 @@ class EnableBluetooth extends BindActivity {
 			case lc : content.Context => new Thread(new Runnable {
 				def run = {
 					// Read service and send bluetooth alert
-					serviceChan.read.alertBluetoothEnabled
+					serviceChan.read.StartUp.alertBluetoothEnabled
 
 					doTasks.post(new Runnable {
 						// Alert user of bluetoth enabledness
@@ -378,7 +415,16 @@ class ChooseDevice extends BindActivity {
 		new Thread(new Runnable {
 			// Blocks until both service is ready and an address is
 			// selected
-			def run = serviceChan.read.alertAddressSelected(Some(chan.read))
+			def run = {
+				var s = serviceChan.read
+				while (true) {
+					var c = chan.read
+					s.StartUp.alertAddressSelected(c match {
+						case null => None
+						case c => Some(c)
+					})
+				}
+			}
 		}).start
 	}
 }
@@ -434,7 +480,7 @@ class Main extends BindActivity {
 								getApplicationContext(),
 								"Test!",
 								widget.Toast.LENGTH_SHORT
-							).show() }})
+							).show }})
 				b
 			})())
 			layout
