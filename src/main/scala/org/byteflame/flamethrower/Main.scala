@@ -9,16 +9,6 @@ import scala.concurrent._
 // recommendations for nearby gas stations on low gasoline
 // detected via OBD-II bluetooth elm327 interface.
 
-// Wrapper class for notifications
-object Notification {
-	def cancel(context : content.Context, id : Int) {
-		context.getSystemService(content.Context.NOTIFICATION_SERVICE) match {
-			case n : app.NotificationManager => n.cancel(id)
-			case _ => throw new ClassCastException
-		}
-	}
-}
-
 class Notification(context : content.Context, id : Int, title : String, text : String, intent : app.PendingIntent = null) {
 
 	def display = context.getSystemService(content.Context.NOTIFICATION_SERVICE) match {
@@ -36,7 +26,10 @@ class Notification(context : content.Context, id : Int, title : String, text : S
 		case _ => throw new ClassCastException
 	}
 
-	def cancel = Notification.cancel(context, id)
+	def cancel = context.getSystemService(content.Context.NOTIFICATION_SERVICE) match {
+		case n : app.NotificationManager => n.cancel(id)
+		case _ => throw new ClassCastException
+	}
 }
 
 // Abstracts the getting and setting of saved data
@@ -83,6 +76,38 @@ class Background extends app.Service {
 
 	var workHandler : os.Handler = null
 
+	object Notif {
+		class UnsupportedDev extends Notification(Background.this,
+			Background.notifIds.UnsupportedDev.id,
+			"Unsupported Device",
+			"FlameThrower requires bluetooth to search for devices.")
+
+		class SelectBt extends Notification(Background.this,
+			Background.notifIds.SelectBt.id,
+			"Choose Device",
+			"Tell FlameThrower which device to connect to.",
+			app.PendingIntent.getActivity(Background.this, 0,
+				new content.Intent(Background.this, classOf[ChooseDevice]),
+				app.PendingIntent.FLAG_UPDATE_CURRENT))
+
+		class EnableBt extends Notification(Background.this,
+			Background.notifIds.EnableBt.id,
+			"Enable Bluetooth?",
+			"FlameThrower requires bluetooth to search for devices.",
+			app.PendingIntent.getActivity(Background.this, 0,
+				new content.Intent(Background.this, classOf[EnableBluetooth]),
+				app.PendingIntent.FLAG_UPDATE_CURRENT))
+
+		// Google Maps notification
+		class NearbyPlaces extends Notification(Background.this,
+			Background.notifIds.SelectBt.id,
+			"Gasoline Level Low",
+			"View nearby gas stations",
+			app.PendingIntent.getActivity(Background.this, 0,
+				new content.Intent(Background.this, classOf[ChooseDevice]),
+				app.PendingIntent.FLAG_UPDATE_CURRENT))
+	}
+
 	// StartUp contains code for starting up
 	// the service and waiting for user changes from
 	// the appropriate activities.
@@ -97,7 +122,16 @@ class Background extends app.Service {
 	}
 
 	class WaitAndConnect extends Runnable {
+		val minLevel = 15
 		val uuid = java.util.UUID.fromString("00001101-0000-1000-8000-00805F9B34FB")
+		val setupCommands = Array(
+			"atz",  // reset
+			"ate0", // echo off
+			"atl0", // line feeds off
+			"ats0", // spaces off
+			"ath0", // headers off
+			"atsp0" // protocol auto
+		)
 
 		def run {
 			SavedData.getMacAddress(Background.this) match {
@@ -117,24 +151,22 @@ class Background extends app.Service {
 									reply
 								}
 
-								sendrcv("atz")   // reset
-								sendrcv("ate0")  // echo off
-								sendrcv("atl0")  // line feeds off
-								sendrcv("ats0")  // spaces off
-								sendrcv("ath0")  // headers off
-								sendrcv("atsp0") // protocol auto
+								// Send initial commands
+								setupCommands.foreach(sendrcv _)
 
-								var fuelLevel = (() => {
+								(() => {
 									var str = sendrcv("012F").trim.replace('\r', '\n')
 									str = str.substring(str.length - 2)
 									Integer.parseInt(str) // byte
-								})()
-
-								widget.Toast.makeText(
-									getApplicationContext(),
-									"FUEL LEVEL: " + fuelLevel,
-									widget.Toast.LENGTH_SHORT
-								).show
+								})() match {
+									case level if level < minLevel => {
+										widget.Toast.makeText(
+											getApplicationContext(),
+											"FUEL LEVEL: " + level,
+											widget.Toast.LENGTH_SHORT
+										).show
+									}
+								}
 
 								// check every 30 seconds
 								workHandler.postDelayed(this, java.util.concurrent.TimeUnit.MILLISECONDS.convert(30, java.util.concurrent.TimeUnit.SECONDS))
@@ -150,28 +182,6 @@ class Background extends app.Service {
 	}
 
 	class StartUp extends Runnable {
-		// Notifications that could be sent
-		private def unsupportedDevNotice = new Notification(Background.this,
-			Background.notifIds.UnsupportedDev.id,
-			"Unsupported Device",
-			"FlameThrower requires bluetooth to search for devices.")
-
-		private def unselectedDevNotice = new Notification(Background.this,
-			Background.notifIds.SelectBt.id,
-			"Choose Device",
-			"Tell FlameThrower which device to connect to.",
-			app.PendingIntent.getActivity(Background.this, 0,
-				new content.Intent(Background.this, classOf[ChooseDevice]),
-				app.PendingIntent.FLAG_UPDATE_CURRENT))
-
-		private def disabledBluetoothNotice = new Notification(Background.this,
-			Background.notifIds.EnableBt.id,
-			"Enable Bluetooth?",
-			"FlameThrower requires bluetooth to search for devices.",
-			app.PendingIntent.getActivity(Background.this, 0,
-				new content.Intent(Background.this, classOf[EnableBluetooth]),
-				app.PendingIntent.FLAG_UPDATE_CURRENT))
-
 		def run = ((ba : bluetooth.BluetoothAdapter) => ba match {
 			// Device does not support bluetooth
 			// Send notification to user detailing failure.
@@ -181,7 +191,7 @@ class Background extends app.Service {
 				// Bluetooth is not enabled
 				// Send notification to user allowing for user to enable
 				// bluetooth via click.
-				var notif = disabledBluetoothNotice
+				var notif = new Notif.EnableBt
 				notif.display
 
 				// Wait here until bluetooth is enabled
@@ -192,7 +202,7 @@ class Background extends app.Service {
 			}
 		})(bluetooth.BluetoothAdapter.getDefaultAdapter()) match {
 			// Notify user of unsupported device
-			case None => unsupportedDevNotice.display
+			case None => (new Notif.UnsupportedDev).display
 			// Bluetooth Adapter avaliable and enabled
 			case Some(ba) => {
 				(SavedData.getMacAddress(Background.this) match {
@@ -200,7 +210,7 @@ class Background extends app.Service {
 					case None => {
 						// Notify user that no default address is set
 						// Link to activity that allows user to choose
-						val notif = unselectedDevNotice
+						val notif = new Notif.SelectBt
 						notif.display
 
 						// Wait for address to be sent
@@ -233,9 +243,6 @@ class Background extends app.Service {
 
 	override def onStartCommand(intent : content.Intent, flags : Int,
 			startId : Int) : Int = {
-
-		// TESTING REMOVE LATER
-		SavedData.clearMacAddress(this)
 
 		// Local Context for notification building from runnable
 		this match {
