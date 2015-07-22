@@ -1,6 +1,6 @@
 package org.byteflame.flamethrower
 
-import android.{content, os, app, widget, graphics, view, util, bluetooth}
+import android.{content, os, app, widget, graphics, view, util, bluetooth, location}
 import android.support.v7
 import scala.concurrent._
 
@@ -11,18 +11,24 @@ import scala.concurrent._
 
 class Notification(context : content.Context, id : Int, title : String, text : String, intent : app.PendingIntent = null) {
 
+	var notif : app.Notification = null
+
+	def build = {
+		notif = (() => {
+			var note = new app.Notification.Builder(context)
+				.setSmallIcon(android.R.drawable.alert_dark_frame)
+				.setContentTitle(title)
+				.setContentText(text)
+
+			if (intent != null) note.setContentIntent(intent)
+
+			note.build
+		})()
+		notif
+	}
+
 	def display = context.getSystemService(content.Context.NOTIFICATION_SERVICE) match {
-		case n : app.NotificationManager => n.notify(id,
-			(() => {
-				var note = new app.Notification.Builder(context)
-					.setSmallIcon(android.R.drawable.alert_dark_frame)
-					.setContentTitle(title)
-					.setContentText(text)
-
-				if (intent != null) note.setContentIntent(intent)
-
-				note.build
-			})())
+		case n : app.NotificationManager => n.notify(id, notif)
 		case _ => throw new ClassCastException
 	}
 
@@ -34,27 +40,29 @@ class Notification(context : content.Context, id : Int, title : String, text : S
 
 // Abstracts the getting and setting of saved data
 object SavedData {
-	val SETTINGS_FILE_KEY = "org.byteflame.flamethrower.USER_SETTINGS"
+	private val SETTINGS_FILE_KEY = "org.byteflame.flamethrower.USER_SETTINGS"
+
 	val MAC_ADDRESS = "MAC_ADDRESS"
+	val LOW_FUEL = "LOW_FUEL"
 
 	// NOTE: SharedPreferences are thread safe, but not process safe.
 
-	// Get default Mac Address
-	def getMacAddress(context : content.Context) : Option[String] = context.getSharedPreferences(SETTINGS_FILE_KEY, content.Context.MODE_PRIVATE).getString(MAC_ADDRESS, null) match {
-		case null => None
-		case a => Some(a)
+	class Entry(context : content.Context, key : String) {
+		def get = context.getSharedPreferences(SETTINGS_FILE_KEY, content.Context.MODE_PRIVATE).getString(key, null) match {
+			case null => None
+			case a => Some(a)
+		}
+
+		def set(value : String) = ((e : content.SharedPreferences.Editor) => {
+			e.putString(key, value)
+			e.commit
+		})(context.getSharedPreferences(SETTINGS_FILE_KEY, content.Context.MODE_PRIVATE).edit)
+
+		def clear = ((e : content.SharedPreferences.Editor) => {
+			e.clear
+			e.commit
+		})(context.getSharedPreferences(SETTINGS_FILE_KEY, content.Context.MODE_PRIVATE).edit)
 	}
-
-	// Set default Mac Address
-	def setMacAddress(context : content.Context, addr : String) = ((e : content.SharedPreferences.Editor) => {
-		e.putString(MAC_ADDRESS, addr)
-		e.commit
-	})(context.getSharedPreferences(SETTINGS_FILE_KEY, content.Context.MODE_PRIVATE).edit)
-
-	def clearMacAddress(context : content.Context) = ((e : content.SharedPreferences.Editor) => {
-		e.clear
-		e.commit
-	})(context.getSharedPreferences(SETTINGS_FILE_KEY, content.Context.MODE_PRIVATE).edit)
 }
 
 // Background Service
@@ -68,7 +76,7 @@ object SavedData {
 object Background {
 	object notifIds extends Enumeration {
 		type notifIds = Value
-		val EnableBt, UnsupportedDev, SelectBt = Value
+		val EnableBt, UnsupportedDev, SelectBt, Map = Value
 	}
 }
 
@@ -97,15 +105,6 @@ class Background extends app.Service {
 			app.PendingIntent.getActivity(Background.this, 0,
 				new content.Intent(Background.this, classOf[EnableBluetooth]),
 				app.PendingIntent.FLAG_UPDATE_CURRENT))
-
-		// Google Maps notification
-		class NearbyPlaces extends Notification(Background.this,
-			Background.notifIds.SelectBt.id,
-			"Gasoline Level Low",
-			"View nearby gas stations",
-			app.PendingIntent.getActivity(Background.this, 0,
-				new content.Intent(Background.this, classOf[ChooseDevice]),
-				app.PendingIntent.FLAG_UPDATE_CURRENT))
 	}
 
 	// StartUp contains code for starting up
@@ -113,63 +112,109 @@ class Background extends app.Service {
 	// the appropriate activities.
 	object StartUp {
 		// Use Channels to communicate blocking tasks.
-		private val addrChan = new Channel[Option[String]]
-		private val btEnableChan = new Channel[Boolean]
+		private var waitResult = new Channel[Option[Any]]
+
+		// Events which StartUp is waiting on,
+		// or Nothing if not waiting.
+		object Events extends Enumeration {
+			val Address, BtEnable, Nothing = Value
+		}
+
+		// Channel that gets waiting
+		private val waitingOn = new Channel[Events.Value]
+
+		private def waitOn(e : Events.Value) = {
+			waitingOn.write(e)
+			if (e != Events.Nothing) {
+				waitResult.read
+			} else None
+		}
 
 		// Callbacks notify blocking tasks
-		def alertBluetoothEnabled = btEnableChan.write(true)
-		def alertAddressSelected(addr : Option[String]) = addrChan.write(addr)
+		def alert(o : Option[_]) = waitResult.write(o)
 	}
 
 	class WaitAndConnect extends Runnable {
-		val minLevel = 15
 		val uuid = java.util.UUID.fromString("00001101-0000-1000-8000-00805F9B34FB")
-		val setupCommands = Array(
-			"atz",  // reset
-			"ate0", // echo off
-			"atl0", // line feeds off
-			"ats0", // spaces off
-			"ath0", // headers off
-			"atsp0" // protocol auto
-		)
 
 		def run {
-			SavedData.getMacAddress(Background.this) match {
+			new SavedData.Entry(Background.this, SavedData.MAC_ADDRESS).get match {
 				case Some(addr) => try {
 						val conn = bluetooth.BluetoothAdapter.getDefaultAdapter.getRemoteDevice(addr).createInsecureRfcommSocketToServiceRecord(uuid)
 						conn.connect()
 						workHandler.post(new Runnable {
 							def run {
-								var in = conn.getInputStream
-								var out = conn.getOutputStream
-
-								def sendrcv(cmd : String) : String = {
-									var reply = ""
-									out.write((cmd+"\r").getBytes)
-									out.flush
-									Stream.continually(in.read).takeWhile(_ != '>').foreach(reply += _)
-									reply
-								}
-
-								// Send initial commands
-								setupCommands.foreach(sendrcv _)
-
-								(() => {
-									var str = sendrcv("012F").trim.replace('\r', '\n')
-									str = str.substring(str.length - 2)
-									Integer.parseInt(str) // byte
-								})() match {
-									case level if level < minLevel => {
-										widget.Toast.makeText(
-											getApplicationContext(),
-											"FUEL LEVEL: " + level,
-											widget.Toast.LENGTH_SHORT
-										).show
+								val minLevel = new SavedData.Entry(Background.this, SavedData.LOW_FUEL).get match {
+									case Some(level) => try {
+										Integer.parseInt(level)
+									} catch {
+										case e : NumberFormatException => -1 // fail
 									}
+									case _ => -1 // fail
 								}
 
-								// check every 30 seconds
-								workHandler.postDelayed(this, java.util.concurrent.TimeUnit.MILLISECONDS.convert(30, java.util.concurrent.TimeUnit.SECONDS))
+								try {
+									var in = conn.getInputStream
+									var out = conn.getOutputStream
+
+									def sendrcv(cmd : String) : String = {
+										var reply = ""
+										out.write((cmd+"\r").getBytes)
+										out.flush
+										Stream.continually(in.read).takeWhile(_ != '>').foreach(reply += _)
+										reply
+									}
+
+									// Send initial commands
+									Array(
+										"atz",  // reset
+										"ate0", // echo off
+										"atl0", // line feeds off
+										"ats0", // spaces off
+										"ath0", // headers off
+										"atsp0" // protocol auto
+									).foreach(sendrcv _)
+
+									(() => {
+										var str = sendrcv("012F").trim.replace('\r', '\n')
+										str = str.substring(str.length - 2)
+										try {
+											Some(Integer.parseInt(str)) // byte
+										} catch {
+											case e : NumberFormatException => None
+										}
+									})() match {
+										case Some(level) if level < minLevel => {
+
+											// Do Google Maps intent here
+											var n = new Notification(Background.this,
+												Background.notifIds.Map.id,
+												"Gasoline Level Low",
+												"View nearby gas stations",
+												app.PendingIntent.getActivity(Background.this, 0, ((() => {
+													val (lat, lng) = getSystemService(content.Context.LOCATION_SERVICE) match {
+														case lm : location.LocationManager => {
+															val m = lm.getLastKnownLocation(location.LocationManager.GPS_PROVIDER)
+															(m.getLatitude, m.getLongitude)
+														}
+													}
+													var mi = new content.Intent(content.Intent.ACTION_VIEW, android.net.Uri.parse("geo:"+lat+","+lng+"?q="+java.net.URLEncoder.encode("gas stations", "UTF-8")))
+													mi.setPackage("com.google.android.apps.maps")
+													mi
+												})()), app.PendingIntent.FLAG_UPDATE_CURRENT))
+											n.build.flags = app.Notification.DEFAULT_LIGHTS | app.Notification.FLAG_AUTO_CANCEL
+											n.display
+										}
+										case _ => ()
+									}
+
+									// check every 30 seconds
+									workHandler.postDelayed(this, java.util.concurrent.TimeUnit.MILLISECONDS.convert(30, java.util.concurrent.TimeUnit.SECONDS))
+
+								} catch {
+									// Retry connecting, this has crashed
+									case ioe: java.io.IOException => workHandler.post(new WaitAndConnect)
+								}
 							}
 						})
 					} catch {
@@ -182,53 +227,65 @@ class Background extends app.Service {
 	}
 
 	class StartUp extends Runnable {
-		def run = ((ba : bluetooth.BluetoothAdapter) => ba match {
-			// Device does not support bluetooth
-			// Send notification to user detailing failure.
-			case null => None
-			case ba if ba.isEnabled => Some(ba)
-			case ba if !ba.isEnabled => {
-				// Bluetooth is not enabled
-				// Send notification to user allowing for user to enable
-				// bluetooth via click.
-				var notif = new Notif.EnableBt
-				notif.display
+		def run = {
+			// TODO get rid of this.
+			new SavedData.Entry(Background.this, SavedData.LOW_FUEL).set(""+20)
+			((ba : bluetooth.BluetoothAdapter) => ba match {
+				// Device does not support bluetooth
+				// Send notification to user detailing failure.
+				case null => None
+				case ba if ba.isEnabled => Some(ba)
+				case ba if !ba.isEnabled => {
+					// Bluetooth is not enabled
+					// Send notification to user allowing for user to enable
+					// bluetooth via click.
+					var notif = new Notif.EnableBt
+					notif.build
+					notif.display
 
-				// Wait here until bluetooth is enabled
-				// False could be returned which should cause failure
-				var b = StartUp.btEnableChan.read
-				notif.cancel
-				if (b) Some(ba) else None
-			}
-		})(bluetooth.BluetoothAdapter.getDefaultAdapter()) match {
-			// Notify user of unsupported device
-			case None => (new Notif.UnsupportedDev).display
-			// Bluetooth Adapter avaliable and enabled
-			case Some(ba) => {
-				(SavedData.getMacAddress(Background.this) match {
-					// No default address set
-					case None => {
-						// Notify user that no default address is set
-						// Link to activity that allows user to choose
-						val notif = new Notif.SelectBt
-						notif.display
-
-						// Wait for address to be sent
-						def lambda = StartUp.addrChan.read match {
-							case Some(addr) => SavedData.setMacAddress(Background.this, addr)
-							case None => ()
-						}
-						// block for it to be set at least once
-						lambda
-						notif.cancel
-
-						// forever keep it updated
-						new Thread(new Runnable {
-							def run = while (true) lambda
-						}).start
+					// Wait here until bluetooth is enabled
+					// False could be returned which should cause failure
+					var b = StartUp.waitOn(StartUp.Events.BtEnable)
+					notif.cancel
+					b match {
+						case Some(_) => Some(ba)
+						case None => None
 					}
-					case Some(_) => ()
-				})
+				}
+			})(bluetooth.BluetoothAdapter.getDefaultAdapter()) match {
+				// Notify user of unsupported device
+				case None => (new Notif.UnsupportedDev).display
+				// Bluetooth Adapter avaliable and enabled
+				case Some(ba) => {
+					(new SavedData.Entry(Background.this, SavedData.MAC_ADDRESS).get match {
+						// No default address set
+						case None => {
+							// Notify user that no default address is set
+							// Link to activity that allows user to choose
+							val notif = new Notif.SelectBt
+							notif.build
+							notif.display
+
+							// Wait for address to be sent
+							def lambda = StartUp.waitOn(StartUp.Events.Address) match {
+								case Some(addr) => addr match {
+									case addr : String => new SavedData.Entry(Background.this, SavedData.MAC_ADDRESS).set(addr)
+									case _ => throw new ClassCastException
+								}
+								case None => ()
+							}
+							// block for it to be set at least once
+							lambda
+							notif.cancel
+
+							// forever keep it updated
+							// new Thread(new Runnable {
+							// 	def run = while (true) lambda
+							// }).start
+						}
+						case Some(_) => ()
+					})
+				}
 			}
 		}
 	}
@@ -307,7 +364,7 @@ class BindActivity extends app.Activity {
 // Enable Bluetooth Activity
 // Opened via notification action, enables bluetooth
 class EnableBluetooth extends BindActivity {
-	override def onCreate(instance : os.Bundle) = {
+	override def onCreate(instance : os.Bundle) {
 		super.onCreate(instance)
 
 		// Enable Bluetooth
@@ -336,7 +393,8 @@ class EnableBluetooth extends BindActivity {
 			case lc : content.Context => new Thread(new Runnable {
 				def run = {
 					// Read service and send bluetooth alert
-					serviceChan.read.StartUp.alertBluetoothEnabled
+					// Contained value of Some does not matter
+					serviceChan.read.StartUp.alert(Some(true))
 
 					doTasks.post(new Runnable {
 						// Alert user of bluetoth enabledness
@@ -383,7 +441,7 @@ class TestAdapter(chan : Channel[String], devices : Array[bluetooth.BluetoothDev
 			})())
 			t.setText(dev.getName + "\n" + dev.getAddress)
 			t.setAlpha(0.5f)
-			SavedData.getMacAddress(t.getContext) match {
+			new SavedData.Entry(t.getContext, SavedData.MAC_ADDRESS).get match {
 				case Some(addr) => if (addr == dev.getAddress) SelectedView.set(t)
 				case None => ()
 			}
@@ -428,7 +486,7 @@ class ChooseDevice extends BindActivity {
 				var s = serviceChan.read
 				while (true) {
 					var c = ChooseDevice.chan.read
-					s.StartUp.alertAddressSelected(c match {
+					s.StartUp.alert(c match {
 						case null => None
 						case c => Some(c)
 					})
