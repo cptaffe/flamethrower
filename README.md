@@ -1,2 +1,3 @@
-This project was originally forked from [Hello-Scaloid-Gradle](//github.com/pocorall/hello-scaloid-gradle).
 
+# flamethrower
+UALR EIT SUPER project code.
